@@ -23,6 +23,8 @@
 #[macro_use]
 extern crate enum_primitive;
 extern crate byteorder;
+extern crate crc;
+extern crate serial;
 
 use std::fmt;
 use std::io;
@@ -38,6 +40,8 @@ pub mod tcp;
 pub use client::Client;
 pub use tcp::Config;
 pub use tcp::Transport;
+
+pub mod rtu;
 
 type Address = u16;
 type Quantity = u16;
