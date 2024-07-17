@@ -72,19 +72,8 @@ impl Transport {
         buff.write_u16::<BigEndian>(count)?;
         buff.write_u16::<LittleEndian>(Self::calculate_checksum(&buff[..]))?;
 
-        self.port.write_all(&buff)?;
-        let mut reply = vec![0; MODBUS_MAX_FRAME_SIZE];
-        // Read address, function code and data count/exception code
-        let mut header = &mut reply[0..3];
-        self.port.read_exact(&mut header)?;
-        Transport::validate_slave_address(self.uid, header)?;
-        Transport::validate_response_code(&buff, header)?;
-
-        let end = 3 + expected_bytes + 2;
-        self.port.read_exact(&mut reply[3..end])?;
-        let frame = &mut reply[0..end];
-        Transport::validate_checksum(frame)?;
-        Transport::get_reply_data(frame, expected_bytes)
+        self.port.write_all(&buff).map_err(Error::Io)?;
+        self.read_response(&buff, expected_bytes)
     }
 
     fn calculate_checksum(packet: &[u8]) -> u16 {
@@ -178,7 +167,7 @@ impl Transport {
         let mut buff = buff;
         buff.write_u16::<BigEndian>(Self::calculate_checksum(buff))?;
 
-        self.port.write_all(buff)?;
+        self.port.write_all(buff).map_err(Error::Io)?;
         let reply = &mut [0; MODBUS_MAX_FRAME_SIZE]; // Slave address, function, byte count
 
         // Read address, function code and data count/exception code
@@ -188,12 +177,61 @@ impl Transport {
         Transport::validate_response_code(buff, header)?;
 
         // The response should be just an echo of the request
-        self.port.read_exact(&mut reply[3..buff.len()])?;
+        self.port.read_exact(&mut reply[3..buff.len()]).map_err(Error::Io)?;
         if &reply[0..buff.len()] != buff {
             Err(Error::InvalidResponse)
         } else {
             Ok(())
         }
+    }
+
+    fn write_read_multiple(&mut self, fun: &Function) -> Result<Vec<u8>> {
+        if let Function::WriteReadMultipleRegisters(write_addr, write_quantity, write_values, read_addr, read_quantity) = *fun {
+            let expected_bytes = 2 * read_quantity as usize;
+
+            let mut buff = Vec::new();
+            buff.write_u8(self.uid)?;
+            buff.write_u8(fun.code())?;
+            buff.write_u16::<BigEndian>(read_addr)?;
+            buff.write_u16::<BigEndian>(read_quantity)?;
+            buff.write_u16::<BigEndian>(write_addr)?;
+            buff.write_u16::<BigEndian>(write_quantity)?;
+            buff.write_u8(write_values.len() as u8)?;
+            for v in write_values {
+                buff.write_u8(*v)?;
+            }
+
+            if buff.is_empty() {
+                return Err(Error::InvalidData(Reason::SendBufferEmpty));
+            }
+
+            if buff.len() + 2 > MODBUS_MAX_FRAME_SIZE {
+                return Err(Error::InvalidData(Reason::SendBufferTooBig));
+            }
+
+            buff.write_u16::<BigEndian>(Self::calculate_checksum(&buff[..]))?;
+
+            self.port.write_all(&buff).map_err(Error::Io)?;
+            self.read_response(&buff, expected_bytes)
+        } else {
+            Err(Error::InvalidFunction)
+        }
+    }
+
+    fn read_response(&mut self, request: &[u8], expected_bytes: usize) -> Result<Vec<u8>> {
+        let reply = &mut [0; MODBUS_MAX_FRAME_SIZE]; // Slave address, function, byte count
+
+        // Read address, function code and data count/exception code
+        let header = &mut reply[0..3];
+        self.port.read_exact(header).map_err(Error::Io)?;
+        Transport::validate_slave_address(self.uid, header)?;
+        Transport::validate_response_code(request, header)?;
+
+        let end = 3 + expected_bytes + 2;
+        self.port.read_exact(&mut reply[3..end]).map_err(Error::Io)?;
+        let frame = &mut reply[0..end];
+        Transport::validate_checksum(frame)?;
+        Transport::get_reply_data(frame, expected_bytes)
     }
 }
 
@@ -250,6 +288,20 @@ impl Client for Transport {
             values.len() as u16,
             &bytes,
         ))
+    }
+
+    /// Write a multiple 16bit registers starting at address `write_addr` and read starting at address `read_addr`.
+    fn write_read_multiple_registers(
+            &mut self,
+            write_address: u16,
+            write_quantity: u16,
+            write_values: &[u16],
+            read_address: u16,
+            read_quantity: u16,
+        ) -> Result<Vec<u16>> {
+        let write_bytes = binary::unpack_bytes(write_values);
+        let read_bytes = self.write_read_multiple(&Function::WriteReadMultipleRegisters(write_address, write_quantity, &write_bytes, read_address, read_quantity))?;
+        binary::pack_bytes(&read_bytes[..])
     }
 
     /// Set the unit identifier.
